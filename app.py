@@ -17,6 +17,7 @@ validation.
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import hmac
 import json
@@ -106,6 +107,14 @@ CREATE TABLE IF NOT EXISTS proposals (
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_one_pending_proposal
     ON proposals(person_id) WHERE status = 'pending';
+
+CREATE TABLE IF NOT EXISTS photos (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    person_id INTEGER NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+    cover INTEGER NOT NULL DEFAULT 0,
+    created_by INTEGER REFERENCES users(id),
+    created_at TEXT NOT NULL
+);
 """
 
 CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
@@ -175,6 +184,12 @@ def jsonify(*args, **kwargs):
 class HTML:
     def __init__(self, text: str):
         self.text = text
+
+
+class FileResponse:
+    def __init__(self, data: bytes, content_type: str):
+        self.data = data
+        self.content_type = content_type
 
 
 class App:
@@ -317,6 +332,44 @@ def user_public(row) -> dict:
     return {"id": row["id"], "name": row["name"], "role": row["role"]}
 
 
+def public_user(db, row) -> dict | None:
+    if not row:
+        return None
+    data = user_public(row)
+    if is_door(db, row["id"]):
+        data["shared"] = True
+    return data
+
+
+def is_door(db, user_id) -> bool:
+    door = get_setting(db, "door_user_id")
+    return bool(door) and str(user_id) == str(door)
+
+
+def ensure_door_user(db):
+    door_id = get_setting(db, "door_user_id")
+    if door_id:
+        row = db.execute(
+            "SELECT id, name, role FROM users WHERE id = ?", (int(door_id),)
+        ).fetchone()
+        if row:
+            return row
+    name = "Famille"
+    suffix = 2
+    while name_taken(db, name):
+        name = f"Famille {suffix}"
+        suffix += 1
+    db.execute(
+        "INSERT INTO users (name, password_hash, role, created_at) VALUES (?, ?, 'member', ?)",
+        (name, hash_password(secrets.token_urlsafe(32)), now()),
+    )
+    user_id = db.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+    set_setting(db, "door_user_id", str(user_id))
+    return db.execute(
+        "SELECT id, name, role FROM users WHERE id = ?", (user_id,)
+    ).fetchone()
+
+
 def person_json(row) -> dict:
     return {
         "id": row["id"],
@@ -332,6 +385,47 @@ def person_json(row) -> dict:
         "created_by_name": row["created_by_name"],
         "created_at": row["created_at"],
     }
+
+
+def photo_dir() -> Path:
+    path = DATA / "photos"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def photo_file(photo_id: int) -> Path:
+    return photo_dir() / f"{int(photo_id)}.jpg"
+
+
+def delete_person_photos(db, person_id: int) -> None:
+    rows = db.execute("SELECT id FROM photos WHERE person_id = ?", (person_id,)).fetchall()
+    for row in rows:
+        photo_file(row["id"]).unlink(missing_ok=True)
+
+
+def erase_person(db, person_id: int) -> None:
+    delete_person_photos(db, person_id)
+    db.execute("DELETE FROM people WHERE id = ?", (person_id,))
+
+
+def decode_image(value) -> bytes:
+    if not isinstance(value, str) or not value.startswith("data:image/"):
+        raise ValueError("Choisissez une photo.")
+    header, _, encoded = value.partition(",")
+    if ";base64" not in header or not encoded:
+        raise ValueError("Cette photo ne peut pas être lue.")
+    mime = header[5:].split(";", 1)[0]
+    if mime not in {"image/jpeg", "image/png", "image/webp", "image/gif"}:
+        raise ValueError("Utilisez une photo au format habituel (JPEG ou PNG).")
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except (ValueError, TypeError) as exc:
+        raise ValueError("Cette photo ne peut pas être lue.") from exc
+    if not raw or len(raw) > 2_500_000:
+        raise ValueError("Cette photo est trop lourde.")
+    if not raw.startswith(b"\xff\xd8"):
+        raise ValueError("Cette photo ne peut pas être lue.")
+    return raw
 
 
 def relation_json(row) -> dict:
@@ -425,12 +519,30 @@ def tree_payload(db, user) -> dict:
         users = db.execute(
             "SELECT id, name, role, created_at FROM users ORDER BY id"
         ).fetchall()
+    user_rows = []
+    for row in users:
+        item = dict(row)
+        if is_door(db, item["id"]):
+            item["shared"] = True
+        user_rows.append(item)
+    photo_rows = db.execute(
+        "SELECT id, person_id FROM photos ORDER BY cover DESC, id"
+    ).fetchall()
+    photos_of = {}
+    for row in photo_rows:
+        photos_of.setdefault(row["person_id"], []).append(row["id"])
+    people_json = []
+    for row in people:
+        item = person_json(row)
+        item["photos"] = photos_of.get(row["id"], [])
+        item["photo_id"] = item["photos"][0] if item["photos"] else None
+        people_json.append(item)
     return {
-        "people": [person_json(row) for row in people],
+        "people": people_json,
         "relations": [relation_json(row) for row in relations],
         "proposals": [proposal_json(row) for row in proposals],
         "family_code": ensure_family_code(db),
-        "users": [dict(row) for row in users],
+        "users": user_rows,
     }
 
 
@@ -689,10 +801,10 @@ def delete_person(db, user, person_id: int) -> str:
     if person["status"] == "pending":
         if user["role"] != "admin" and person["created_by"] != user["id"]:
             raise ValueError("Seul l'auteur ou l'administrateur peut retirer cette proposition.")
-        db.execute("DELETE FROM people WHERE id = ?", (person_id,))
+        erase_person(db, person_id)
         return "deleted"
     if user["role"] == "admin":
-        db.execute("DELETE FROM people WHERE id = ?", (person_id,))
+        erase_person(db, person_id)
         return "deleted"
     existing = pending_proposal(db, person_id)
     if existing and existing["kind"] == "update":
@@ -763,7 +875,7 @@ def review(db, user, action: str, kind: str, target_id: int) -> None:
             person = ensure_person(db, target_id)
             if person["status"] != "pending":
                 raise ValueError("Cette fiche n'est pas en attente.")
-            db.execute("DELETE FROM people WHERE id = ?", (target_id,))
+            erase_person(db, target_id)
         return
     if kind == "proposal":
         prop = db.execute("SELECT * FROM proposals WHERE id = ?", (target_id,)).fetchone()
@@ -780,7 +892,7 @@ def review(db, user, action: str, kind: str, target_id: int) -> None:
                 (user["id"], now(), prop["id"]),
             )
         elif action == "approve" and prop["kind"] == "delete":
-            db.execute("DELETE FROM people WHERE id = ?", (prop["person_id"],))
+            erase_person(db, prop["person_id"])
         else:
             db.execute(
                 """
@@ -843,9 +955,10 @@ def status():
     with db_conn() as db:
         count = db.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"]
         row = fetch_user(db)
+        user = public_user(db, row)
     if session.get("user_id") and not row:
         session.clear()
-    return jsonify(needs_setup=count == 0, user=user_public(row) if row else None)
+    return jsonify(needs_setup=count == 0, user=user)
 
 
 @app.post("/api/setup")
@@ -869,10 +982,11 @@ def setup():
             row = db.execute(
                 "SELECT id, name, role FROM users WHERE id = ?", (user_id,)
             ).fetchone()
+            public = public_user(db, row)
         session.clear()
         session["user_id"] = row["id"]
         session.permanent = True
-        return jsonify(user=user_public(row))
+        return jsonify(user=public)
     except ValueError as exc:
         return fail(str(exc))
 
@@ -892,7 +1006,7 @@ def join():
                 raise ValueError("L'administrateur doit d'abord créer l'arbre.")
             expected = normalize_code(ensure_family_code(db))
             if not code or code != expected:
-                raise ValueError("Ce code famille n'est pas le bon.")
+                raise ValueError("Ce code familial n'est pas le bon.")
             if name_taken(db, name):
                 raise ValueError("Ce nom est déjà utilisé. Choisissez-en un autre, ou entrez avec le mot de passe déjà choisi.")
             db.execute(
@@ -903,10 +1017,11 @@ def join():
             row = db.execute(
                 "SELECT id, name, role FROM users WHERE id = ?", (user_id,)
             ).fetchone()
+            public = public_user(db, row)
         session.clear()
         session["user_id"] = row["id"]
         session.permanent = True
-        return jsonify(user=user_public(row))
+        return jsonify(user=public)
     except ValueError as exc:
         return fail(str(exc))
 
@@ -921,13 +1036,38 @@ def login():
             raise ValueError("Nom ou mot de passe incorrect.")
         with db_conn() as db:
             rows = db.execute("SELECT id, name, role, password_hash FROM users").fetchall()
-        row = next((item for item in rows if item["name"].casefold() == name.casefold()), None)
-        if not row or not verify_password(password, row["password_hash"]):
-            return fail("Nom ou mot de passe incorrect.", 401)
+            row = next((item for item in rows if item["name"].casefold() == name.casefold()), None)
+            if not row or not verify_password(password, row["password_hash"]):
+                return fail("Nom ou mot de passe incorrect.", 401)
+            public = public_user(db, row)
         session.clear()
         session["user_id"] = row["id"]
         session.permanent = True
-        return jsonify(user=user_public(row))
+        return jsonify(user=public)
+    except ValueError as exc:
+        return fail(str(exc))
+
+
+@app.post("/api/code")
+def code_login():
+    try:
+        data = read_json()
+        with db_conn() as db:
+            count = db.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"]
+            if not count:
+                raise ValueError(
+                    "Il n'y a pas encore d'arbre. Ouvrez l'onglet Compte pour en créer un."
+                )
+            entered = normalize_code(data.get("code") or "")
+            current = normalize_code(get_setting(db, "family_code") or "")
+            if not entered or entered != current:
+                raise ValueError("Ce code familial n'est pas le bon.")
+            row = ensure_door_user(db)
+            public = public_user(db, row)
+        session.clear()
+        session["user_id"] = row["id"]
+        session.permanent = True
+        return jsonify(user=public)
     except ValueError as exc:
         return fail(str(exc))
 
@@ -950,6 +1090,8 @@ def change_password(user):
         if not isinstance(current, str):
             raise ValueError("Le mot de passe actuel est incorrect.")
         with db_conn() as db:
+            if is_door(db, user["id"]):
+                raise ValueError("Cet accès utilise le code familial. Il n'a pas de mot de passe.")
             row = db.execute(
                 "SELECT password_hash FROM users WHERE id = ?", (user["id"],)
             ).fetchone()
@@ -970,6 +1112,90 @@ def get_tree(user):
     with db_conn() as db:
         payload = tree_payload(db, user)
     return jsonify(payload)
+
+
+@app.get("/api/photos/<int:photo_id>")
+@login_required
+def get_photo(user, photo_id):
+    with db_conn() as db:
+        row = db.execute("SELECT id FROM photos WHERE id = ?", (photo_id,)).fetchone()
+    if not row:
+        return fail("Cette photo est introuvable.", 404)
+    path = photo_file(photo_id)
+    if not path.is_file():
+        return fail("Cette photo est introuvable.", 404)
+    return FileResponse(path.read_bytes(), "image/jpeg")
+
+
+@app.post("/api/people/<int:person_id>/photos")
+@login_required
+def add_photo(user, person_id):
+    try:
+        data = read_json()
+        raw = decode_image(data.get("image"))
+        with db_conn() as db:
+            ensure_person(db, person_id)
+            count = db.execute(
+                "SELECT COUNT(*) AS c FROM photos WHERE person_id = ?", (person_id,)
+            ).fetchone()["c"]
+            if count >= 12:
+                raise ValueError("Douze photos suffisent pour une fiche.")
+            has_cover = db.execute(
+                "SELECT id FROM photos WHERE person_id = ? AND cover = 1", (person_id,)
+            ).fetchone()
+            db.execute(
+                "INSERT INTO photos (person_id, cover, created_by, created_at) VALUES (?, ?, ?, ?)",
+                (person_id, 0 if has_cover else 1, user["id"], now()),
+            )
+            photo_id = db.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+            photo_file(photo_id).write_bytes(raw)
+            payload = tree_payload(db, user)
+        return jsonify(payload)
+    except ValueError as exc:
+        return fail(str(exc))
+
+
+@app.post("/api/photos/<int:photo_id>/cover")
+@login_required
+def cover_photo(user, photo_id):
+    try:
+        with db_conn() as db:
+            row = db.execute("SELECT person_id FROM photos WHERE id = ?", (photo_id,)).fetchone()
+            if not row:
+                raise ValueError("Cette photo est introuvable.")
+            db.execute("UPDATE photos SET cover = 0 WHERE person_id = ?", (row["person_id"],))
+            db.execute("UPDATE photos SET cover = 1 WHERE id = ?", (photo_id,))
+            payload = tree_payload(db, user)
+        return jsonify(payload)
+    except ValueError as exc:
+        return fail(str(exc))
+
+
+@app.delete("/api/photos/<int:photo_id>")
+@login_required
+def remove_photo(user, photo_id):
+    try:
+        with db_conn() as db:
+            row = db.execute(
+                "SELECT id, person_id, cover, created_by FROM photos WHERE id = ?", (photo_id,)
+            ).fetchone()
+            if not row:
+                raise ValueError("Cette photo est introuvable.")
+            if user["role"] != "admin" and row["created_by"] != user["id"]:
+                raise ValueError("Seul l'auteur ou l'administrateur peut retirer cette photo.")
+            photo_file(photo_id).unlink(missing_ok=True)
+            db.execute("DELETE FROM photos WHERE id = ?", (photo_id,))
+            if row["cover"]:
+                nxt = db.execute(
+                    "SELECT id FROM photos WHERE person_id = ? ORDER BY id LIMIT 1",
+                    (row["person_id"],),
+                ).fetchone()
+                if nxt:
+                    db.execute("UPDATE photos SET cover = 1 WHERE id = ?", (nxt["id"],))
+            payload = tree_payload(db, user)
+        return jsonify(payload)
+    except ValueError as exc:
+        return fail(str(exc))
 
 
 @app.post("/api/people")
@@ -1131,6 +1357,8 @@ def reset_user_password(user, user_id):
             row = db.execute("SELECT id FROM users WHERE id = ?", (user_id,)).fetchone()
             if not row:
                 raise ValueError("Cette personne est introuvable.")
+            if is_door(db, row["id"]):
+                raise ValueError("Ce compte sert au code familial. Il n'a pas de mot de passe.")
             db.execute(
                 "UPDATE users SET password_hash = ? WHERE id = ?",
                 (hash_password(password), user_id),
@@ -1156,6 +1384,8 @@ def change_role(user, user_id):
             row = db.execute("SELECT id, role FROM users WHERE id = ?", (user_id,)).fetchone()
             if not row:
                 raise ValueError("Cette personne est introuvable.")
+            if is_door(db, row["id"]):
+                raise ValueError("Ce compte sert au code familial. Il reste un accès simple.")
             if role == "member" and row["role"] == "admin":
                 admins = db.execute(
                     "SELECT COUNT(*) AS c FROM users WHERE role = 'admin'"
@@ -1287,7 +1517,7 @@ class RacineHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = unquote(parsed.path)
         length = int(self.headers.get("Content-Length") or 0)
-        if length > 1_000_000:
+        if length > 3_000_000:
             self._send(413, b'{"error":"Message trop volumineux."}', "application/json; charset=utf-8", None)
             return
         raw = self.rfile.read(length) if length else b""
@@ -1317,6 +1547,9 @@ class RacineHandler(BaseHTTPRequestHandler):
         cookie = cookie_header()
         if isinstance(result, HTML):
             self._send(200, result.text.encode("utf-8"), "text/html; charset=utf-8", cookie)
+            return
+        if isinstance(result, FileResponse):
+            self._send(200, result.data, result.content_type, cookie)
             return
         if isinstance(result, tuple):
             payload, status = result
